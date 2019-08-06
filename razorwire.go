@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -16,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/jetstack/cert-manager/third_party/crypto/acme"
 	"github.com/miekg/dns"
@@ -36,10 +38,23 @@ func main() {
 		panic(err)
 	}
 	go runDNS(ctx)
-	_, err = validateCert(ctx, cache, client)
+	tlscert, err := getCert(ctx, cache, "*.proxy.zomg.net")
 	if err != nil {
-		fmt.Printf("Error validating cert: %s\n", err)
+		fmt.Printf("Error fetching cert from cache, getting it from acme: %s\n", err)
+		tlscert, err = validateCert(ctx, cache, client)
+		if err != nil {
+			panic(err)
+		}
 	}
+	// TODO: eventually changing certs on the fly will require using a tls.Listener
+	cfg := &tls.Config{Certificates: []tls.Certificate{*tlscert}}
+	srv := &http.Server{
+		Addr:         ":8443",
+		TLSConfig:    cfg,
+		ReadTimeout:  time.Minute,
+		WriteTimeout: time.Minute,
+	}
+	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
 var txtRecord = "foo"
@@ -50,7 +65,7 @@ func queryResponse(m *dns.Msg) {
 		switch q.Qtype {
 		case dns.TypeA:
 			log.Printf("Query for %s\n", q.Name)
-			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN A %s", q.Name, "1.1.1.1"))
+			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN A %s", q.Name, "144.202.87.245"))
 			if err == nil {
 				m.Answer = append(m.Answer, rr)
 			}
@@ -117,7 +132,7 @@ func runDNS(ctx context.Context) {
 	server.Shutdown()
 }
 
-func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Client) ([][]byte, error) {
+func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Client) (*tls.Certificate, error) {
 	// order:
 	// createorder, getauthorization, waitforauthorization, waitfororder, CreateCert
 	order := acme.NewOrder("*.proxy.zomg.net")
@@ -167,7 +182,23 @@ func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Cli
 	encodeCert(&buf, cert)
 	cache.Put(ctx, "*.proxy.zomg.net-cert", buf.Bytes())
 
-	return cert, nil
+	return getCert(ctx, cache, "*.proxy.zomg.net")
+}
+
+func getCert(ctx context.Context, cache autocert.DirCache, name string) (*tls.Certificate, error) {
+	key, err := cache.Get(ctx, name+"-key")
+	if err != nil {
+		return nil, err
+	}
+	cert, err := cache.Get(ctx, name+"-cert")
+	if err != nil {
+		return nil, err
+	}
+	x509cert, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return nil, err
+	}
+	return &x509cert, nil
 }
 
 func makeClient(ctx context.Context, cache autocert.DirCache) (*acme.Client, error) {
