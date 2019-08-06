@@ -17,8 +17,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/jetstack/cert-manager/third_party/crypto/acme"
 	"github.com/miekg/dns"
-	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -31,11 +31,15 @@ func main() {
 	fmt.Println("Hello world")
 	cache := autocert.DirCache(".")
 	ctx := context.Background()
-	_, err := makeClient(ctx, cache)
+	client, err := makeClient(ctx, cache)
 	if err != nil {
-		fmt.Printf("Error making client: %s\n", err)
+		panic(err)
 	}
-	runDNS()
+	go runDNS(ctx)
+	_, err = validateCert(ctx, cache, client)
+	if err != nil {
+		fmt.Printf("Error validating cert: %s\n", err)
+	}
 }
 
 var txtRecord = "foo"
@@ -73,7 +77,7 @@ func queryResponse(m *dns.Msg) {
 }
 
 func handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
-	fmt.Printf("Received query for %+v\n", *r)
+	//fmt.Printf("Received query for %+v\n", *r)
 	m := new(dns.Msg)
 	m.SetReply(r)
 	m.Compress = false
@@ -96,7 +100,7 @@ func handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	w.WriteMsg(m)
 }
 
-func runDNS() {
+func runDNS(ctx context.Context) {
 	dns.HandleFunc("proxy.zomg.net.", handleDNSQuery)
 
 	// start server
@@ -106,33 +110,82 @@ func runDNS() {
 	server := &dns.Server{Addr: ":" + strconv.Itoa(port), Net: "udp"}
 	log.Printf("Starting at %d\n", port)
 	err := server.ListenAndServe()
-	defer server.Shutdown()
 	if err != nil {
 		log.Fatalf("Failed to start server: %s\n ", err.Error())
 	}
+	<-ctx.Done()
+	server.Shutdown()
+}
+
+func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Client) ([][]byte, error) {
+	// order:
+	// createorder, getauthorization, waitforauthorization, waitfororder, CreateCert
+	order := acme.NewOrder("*.proxy.zomg.net")
+	order, err := client.CreateOrder(ctx, order)
+	if err != nil {
+		return nil, err
+	}
+	if len(order.Authorizations) != 1 {
+		return nil, fmt.Errorf("Received more than 1 authorization for 1 cert request")
+	}
+	auth, err := client.GetAuthorization(ctx, order.Authorizations[0])
+	if err != nil {
+		return nil, err
+	}
+	var challenge *acme.Challenge
+	for _, c := range auth.Challenges {
+		fmt.Printf("Available challenge: %s\n", c.Type)
+		if c.Type == "dns-01" {
+			challenge = c
+		}
+	}
+	if challenge == nil {
+		return nil, fmt.Errorf("Challenge dns-01 not found")
+	}
+	rec, err := client.DNS01ChallengeRecord(challenge.Token)
+	if err != nil {
+		return nil, err
+	}
+	txtRecord = rec
+	fmt.Printf("Accepting challenge\n")
+	client.AcceptChallenge(ctx, challenge)
+	auth, err = client.WaitAuthorization(ctx, auth.URL)
+	if err != nil {
+		return nil, err
+	}
+	key, err := getKey(ctx, cache, "*.proxy.zomg.net")
+	if err != nil {
+		return nil, err
+	}
+	csr, err := makeCSR(key, "*.proxy.zomg.net")
+	cert, err := client.FinalizeOrder(ctx, order.FinalizeURL, csr)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("Certificate successfully finalized!\n")
+	var buf bytes.Buffer
+	encodeCert(&buf, cert)
+	cache.Put(ctx, "*.proxy.zomg.net-cert", buf.Bytes())
+
+	return cert, nil
 }
 
 func makeClient(ctx context.Context, cache autocert.DirCache) (*acme.Client, error) {
 	client := acme.Client{
-		//DirectoryURL: letsEncryptStagingURL,
-		UserAgent: "razorwire proxy",
+		DirectoryURL: letsEncryptStagingURL,
+		UserAgent:    "razorwire proxy",
 	}
 	acc := acme.Account{
-		Contact: []string{"mailto:akramer@gmail.com"},
+		Contact:     []string{"mailto:akramer@gmail.com"},
+		TermsAgreed: true,
 	}
 	key, err := getAccountKey(ctx, cache, &acc)
 	if err != nil {
 		return nil, err
 	}
 	client.Key = key
-	fmt.Printf("Calling discover\n")
-	disc, err := client.Discover(ctx)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Printf("%q", disc)
 	fmt.Printf("About to make registration call\n")
-	_, err = client.Register(ctx, &acc, acme.AcceptTOS)
+	_, err = client.CreateAccount(ctx, &acc)
 	if ae, ok := err.(*acme.Error); err == nil || ok && ae.StatusCode == http.StatusConflict {
 		// conflict indicates the key is already registered
 		fmt.Println("Account already exists")
@@ -145,7 +198,7 @@ func makeClient(ctx context.Context, cache autocert.DirCache) (*acme.Client, err
 }
 
 func getAccountKey(ctx context.Context, cache autocert.DirCache, account *acme.Account) (*ecdsa.PrivateKey, error) {
-	accountKey := fmt.Sprintf("acme_account_key:%s", account.Contact)
+	accountKey := fmt.Sprintf("acme_account_key")
 	return getKey(ctx, cache, accountKey)
 }
 
@@ -158,7 +211,7 @@ func makeCSR(key crypto.Signer, cn string) ([]byte, error) {
 
 // getKey gets a key from the cache, or generates a new one if it did not exist.
 func getKey(ctx context.Context, cache autocert.DirCache, name string) (*ecdsa.PrivateKey, error) {
-	data, err := cache.Get(ctx, name)
+	data, err := cache.Get(ctx, name+"-key")
 	if err == autocert.ErrCacheMiss {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -168,7 +221,7 @@ func getKey(ctx context.Context, cache autocert.DirCache, name string) (*ecdsa.P
 		if err := encodeECDSAKey(&buf, key); err != nil {
 			return nil, err
 		}
-		if err := cache.Put(ctx, name, buf.Bytes()); err != nil {
+		if err := cache.Put(ctx, name+"-key", buf.Bytes()); err != nil {
 			return nil, err
 		}
 		return key, nil
@@ -182,6 +235,17 @@ func getKey(ctx context.Context, cache autocert.DirCache, name string) (*ecdsa.P
 		return nil, err
 	}
 	return key, err
+}
+
+func encodeCert(w io.Writer, data [][]byte) error {
+	for _, b := range data {
+		pb := &pem.Block{Type: "CERTIFICATE", Bytes: b}
+		err := pem.Encode(w, pb)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func encodeECDSAKey(w io.Writer, key *ecdsa.PrivateKey) error {
