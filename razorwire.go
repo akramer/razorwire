@@ -203,8 +203,8 @@ func getCert(ctx context.Context, cache autocert.DirCache, name string) (*tls.Ce
 
 func makeClient(ctx context.Context, cache autocert.DirCache) (*acme.Client, error) {
 	client := acme.Client{
-		DirectoryURL: letsEncryptStagingURL,
-		UserAgent:    "razorwire proxy",
+		//DirectoryURL: letsEncryptStagingURL,
+		UserAgent: "razorwire proxy",
 	}
 	acc := acme.Account{
 		Contact:     []string{"mailto:akramer@gmail.com"},
