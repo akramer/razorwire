@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/alexflint/go-arg"
 	"github.com/jetstack/cert-manager/third_party/crypto/acme"
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/acme/autocert"
@@ -29,7 +30,19 @@ const (
 	letsEncryptStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
 )
 
+var args struct {
+	Email       string `arg:"required" help:"e-mail to register with LetsEncrypt"`
+	ProxyDomain string `arg:"required" help:"domain pointed at this server"`
+	Hostname    string `arg:"required" help:"hostname pointed at this server"`
+	IP          string `arg:"required" help:"IP address of this proxy"`
+	CertName    string `arg:"-"`
+	Zone        string `arg:"-"`
+}
+
 func main() {
+	arg.MustParse(&args)
+	args.CertName = "*." + args.ProxyDomain
+	args.Zone = args.ProxyDomain + "."
 	fmt.Println("Hello world")
 	cache := autocert.DirCache(".")
 	ctx := context.Background()
@@ -38,7 +51,7 @@ func main() {
 		panic(err)
 	}
 	go runDNS(ctx)
-	tlscert, err := getCert(ctx, cache, "*.proxy.zomg.net")
+	tlscert, err := getCert(ctx, cache, args.CertName)
 	if err != nil {
 		fmt.Printf("Error fetching cert from cache, getting it from acme: %s\n", err)
 		tlscert, err = validateCert(ctx, cache, client)
@@ -58,14 +71,14 @@ func main() {
 }
 
 var txtRecord = "foo"
-var domainName = "proxy.zomg.net."
 
 func queryResponse(m *dns.Msg) {
+	host := args.Hostname + "."
 	for _, q := range m.Question {
 		switch q.Qtype {
 		case dns.TypeA:
 			log.Printf("Query for %s\n", q.Name)
-			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN A %s", q.Name, "144.202.87.245"))
+			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN A %s", q.Name, args.IP))
 			if err == nil {
 				m.Answer = append(m.Answer, rr)
 			}
@@ -77,14 +90,14 @@ func queryResponse(m *dns.Msg) {
 			}
 		case dns.TypeNS:
 			log.Printf("Query for %s\n", q.Name)
-			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN NS %s", q.Name, "razorwire.zomg.net."))
+			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN NS %s", q.Name, host))
 			if err == nil {
 				m.Answer = append(m.Answer, rr)
 			}
 		case dns.TypeSOA:
 			log.Printf("Query for %s\n", q.Name)
-			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN SOA razorwire.zomg.net. hostmaster.zomg.net. 1 86400 3600 259200 300", "proxy.zomg.net."))
-			if err == nil && q.Name == domainName {
+			rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN SOA %s hostmaster.%s 1 86400 3600 259200 300", args.Zone, host, args.Zone))
+			if err == nil && q.Name == args.Zone {
 				m.Answer = append(m.Answer, rr)
 			}
 		}
@@ -104,7 +117,9 @@ func handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		w.WriteMsg(m)
 		return
 	}
-	rr, err := dns.NewRR(fmt.Sprintf("%s 300 IN SOA razorwire.zomg.net. hostmaster.zomg.net. 1 86400 3600 259200 300", "proxy.zomg.net."))
+	host := args.Hostname + "."
+	soa := fmt.Sprintf("%s 300 IN SOA %s hostmaster.%s 1 86400 3600 259200 300", args.Zone, host, args.Zone)
+	rr, err := dns.NewRR(soa)
 	if err != nil {
 		return
 	}
@@ -116,7 +131,7 @@ func handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 }
 
 func runDNS(ctx context.Context) {
-	dns.HandleFunc("proxy.zomg.net.", handleDNSQuery)
+	dns.HandleFunc(args.Zone, handleDNSQuery)
 
 	// start server
 	// can redirect with something like
@@ -135,7 +150,7 @@ func runDNS(ctx context.Context) {
 func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Client) (*tls.Certificate, error) {
 	// order:
 	// createorder, getauthorization, waitforauthorization, waitfororder, CreateCert
-	order := acme.NewOrder("*.proxy.zomg.net")
+	order := acme.NewOrder(args.CertName)
 	order, err := client.CreateOrder(ctx, order)
 	if err != nil {
 		return nil, err
@@ -168,11 +183,11 @@ func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Cli
 	if err != nil {
 		return nil, err
 	}
-	key, err := getKey(ctx, cache, "*.proxy.zomg.net")
+	key, err := getKey(ctx, cache, args.CertName)
 	if err != nil {
 		return nil, err
 	}
-	csr, err := makeCSR(key, "*.proxy.zomg.net")
+	csr, err := makeCSR(key, args.CertName)
 	cert, err := client.FinalizeOrder(ctx, order.FinalizeURL, csr)
 	if err != nil {
 		return nil, err
@@ -180,9 +195,9 @@ func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Cli
 	fmt.Printf("Certificate successfully finalized!\n")
 	var buf bytes.Buffer
 	encodeCert(&buf, cert)
-	cache.Put(ctx, "*.proxy.zomg.net-cert", buf.Bytes())
+	cache.Put(ctx, fmt.Sprintf("*.%s-cert", args.CertName), buf.Bytes())
 
-	return getCert(ctx, cache, "*.proxy.zomg.net")
+	return getCert(ctx, cache, args.CertName)
 }
 
 func getCert(ctx context.Context, cache autocert.DirCache, name string) (*tls.Certificate, error) {
@@ -207,7 +222,7 @@ func makeClient(ctx context.Context, cache autocert.DirCache) (*acme.Client, err
 		UserAgent: "razorwire proxy",
 	}
 	acc := acme.Account{
-		Contact:     []string{"mailto:akramer@gmail.com"},
+		Contact:     []string{fmt.Sprintf("mailto:%s", args.Email)},
 		TermsAgreed: true,
 	}
 	key, err := getAccountKey(ctx, cache, &acc)
