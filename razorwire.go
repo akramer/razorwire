@@ -180,20 +180,25 @@ func (p *proxyRequest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for k, v := range resp.Header {
-		if k == "Connection" || k == "X-Forwarded-Proto" || k == "Strict-Transport-Security" {
+		if k == "Connection" {
 			continue
 		}
 		if redirectURL != nil {
 			if k == "Location" {
-				w.Header().Add("Location", redirectURL.String())
+				w.Header().Set("Location", redirectURL.String())
 			}
+			continue
 		}
 		for _, vs := range v {
 			w.Header().Add(k, vs)
 		}
-		w.Header().Add("Strict-Transport-Security", "max-age=31536000;")
-		w.Header().Add("X-Forwarded-Proto", "https")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000;")
+		w.Header().Set("X-Forwarded-Proto", "https")
+		// TODO: this should comma append, not set a second x-forwarded-for header
 		w.Header().Add("X-Forwarded-For", r.RemoteAddr)
+		if w.Header().Get("X-Forwarded-Host") == "" {
+			w.Header().Set("X-Forwarded-Host", r.Host)
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
@@ -388,7 +393,7 @@ func validateCert(ctx context.Context, cache autocert.DirCache, client *acme.Cli
 	fmt.Printf("Certificate successfully finalized!\n")
 	var buf bytes.Buffer
 	encodeCert(&buf, cert)
-	cache.Put(ctx, fmt.Sprintf("*.%s-cert", args.CertName), buf.Bytes())
+	cache.Put(ctx, fmt.Sprintf("%s-cert", args.CertName), buf.Bytes())
 
 	return getCert(ctx, cache, args.CertName)
 }
