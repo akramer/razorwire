@@ -16,7 +16,9 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
+	"net/url"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/alexflint/go-arg"
@@ -31,15 +33,204 @@ const (
 )
 
 var args struct {
-	Email       string `arg:"required" help:"e-mail to register with LetsEncrypt"`
-	ProxyDomain string `arg:"required" help:"domain pointed at this server"`
-	Hostname    string `arg:"required" help:"hostname pointed at this server"`
-	IP          string `arg:"required" help:"IP address of this proxy"`
-	CertName    string `arg:"-"`
-	Zone        string `arg:"-"`
+	Email       string   `arg:"required" help:"e-mail to register with LetsEncrypt"`
+	ProxyDomain string   `arg:"required" help:"domain pointed at this server"`
+	Hostname    string   `arg:"required" help:"hostname pointed at this server"`
+	IP          string   `arg:"required" help:"IP address of this proxy"`
+	DNSPort     uint     `help:"Port to open for DNS server"`
+	HTTPSPort   uint     `help:"Port to open for HTTPS server"`
+	Username    string   `arg:"required"`
+	Password    string   `arg:"required"`
+	CertName    string   `arg:"-"`
+	Zone        string   `arg:"-"`
+	ProxyName   []string `help:"hosts to proxy, 'name,http://somehost/', multiple are allowed"`
+}
+
+type proxy struct {
+	backendURLMap map[string]*url.URL
+	clientMap     map[string]*http.Client
+}
+
+var proxyRegexp = regexp.MustCompile("^(http|https|nohttps)-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+)(?:-([0-9]+))?$")
+
+func newClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// newProxy initializes a new proxy based on commandline arguments
+func newProxy() proxy {
+	p := proxy{}
+	p.backendURLMap = make(map[string]*url.URL)
+	p.clientMap = make(map[string]*http.Client)
+	for _, n := range args.ProxyName {
+		vals := strings.Split(n, ",")
+		if len(vals) != 2 {
+			panic(fmt.Sprintf("Error with --proxyname arg: %s", n))
+		}
+		k, v := vals[0], vals[1]
+		u, err := url.Parse(v)
+		if err != nil {
+			panic(fmt.Sprintf("error parsing --proxyname URL: %s", err))
+		}
+		fmt.Printf("Adding proxy mapping %s->%s\n", vals[0], vals[1])
+		p.backendURLMap[k] = u
+	}
+	return p
+}
+
+func (p proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	user, password, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Add("WWW-Authenticate", "Basic realm=\"authenticate\"")
+		http.Error(w, "error in basic auth", 401)
+		return
+	}
+	if user != args.Username || password != args.Password {
+		w.Header().Add("WWW-Authenticate", "Basic realm=\"authenticate\"")
+		http.Error(w, "error in basic auth", 401)
+		return
+	}
+	s := strings.Split(r.Host, ".")
+	u, ok := p.backendURLMap[s[0]]
+	var err error
+	cl, ok := p.clientMap[s[0]]
+	if !ok {
+		cl = newClient()
+	}
+	if !ok {
+		if sm := proxyRegexp.FindStringSubmatch(s[0]); sm != nil {
+			var ur string
+			if sm[1] == "nohttps" {
+				sm[1] = "https"
+				if cl.Transport == nil {
+					t := http.Transport{
+						TLSClientConfig: &tls.Config{
+							InsecureSkipVerify: true,
+						},
+					}
+					cl.Transport = &t
+				}
+			}
+			if len(sm) < 7 || sm[6] == "" {
+				ur = fmt.Sprintf("%s://%s.%s.%s.%s/", sm[1], sm[2], sm[3], sm[4], sm[5])
+			} else {
+				ur = fmt.Sprintf("%s://%s.%s.%s.%s:%s/", sm[1], sm[2], sm[3], sm[4], sm[5], sm[6])
+			}
+			u, err = url.Parse(ur)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("unknown host: %s", s[0]), 404)
+			}
+		} else {
+			http.Error(w, fmt.Sprintf("unknown host: %s", s[0]), 404)
+			return
+		}
+	}
+	(&proxyRequest{
+		client:     cl,
+		backendURL: u,
+	}).ServeHTTP(w, r)
+}
+
+type proxyRequest struct {
+	client     *http.Client
+	backendURL *url.URL
+}
+
+func (p *proxyRequest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	header := make(http.Header)
+	for k, v := range r.Header {
+		// should probably be case insensitive matches
+		if k == "Authorization" || k == "Close" || k == "Host" || k == "Accept-Encoding" {
+			continue
+		}
+		fmt.Printf("Adding header %s: %v\n", k, v)
+		header[k] = v
+	}
+	fmt.Printf("Done adding headers\n")
+	// TODO: figure this out
+	// do I want rawpath or path?
+	fmt.Printf("backendurl: %v", p.backendURL)
+	weirdurl := fmt.Sprintf("%s://%s%s", p.backendURL.Scheme, p.backendURL.Host, r.RequestURI)
+	fmt.Printf("Parsing url %s\n", weirdurl)
+	u, err := url.Parse(weirdurl)
+	fmt.Printf("post-parse\n")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	fmt.Printf("up to the middle of HTTP proxying\n")
+	req := http.Request{
+		URL:           u,
+		Method:        r.Method,
+		Header:        header,
+		Body:          r.Body,
+		ContentLength: r.ContentLength,
+		Trailer:       r.Trailer,
+	}
+	fmt.Printf("Sending a request to %+v\n", req)
+	resp, err := p.client.Do(&req)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	fmt.Printf("Got response code %d\n", resp.StatusCode)
+	var redirectURL *url.URL
+	if resp.StatusCode == 301 || resp.StatusCode == 302 {
+		fmt.Printf("Running redirect check\n")
+		redirectURL, err = p.checkRedirect(r, resp)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	for k, v := range resp.Header {
+		if k == "Connection" {
+			continue
+		}
+		if redirectURL != nil {
+			if k == "Location" {
+				w.Header().Add("Location", redirectURL.String())
+			}
+		}
+		for _, vs := range v {
+			w.Header().Add(k, vs)
+		}
+		w.Header().Add("Strict-Transport-Security", "max-age=31536000;")
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func (p *proxyRequest) checkRedirect(req *http.Request, resp *http.Response) (*url.URL, error) {
+	loc, found := resp.Header["Location"]
+	if !found {
+		return nil, fmt.Errorf("Location header not found in redirect request")
+	}
+	fmt.Printf("Found location header %s\n", loc[0])
+	u, err := url.Parse(loc[0])
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing URL in redirect request, %v", err)
+	}
+	// If the 301 or 302 points at the same host/port/scheme that we just talked to, redirect to the same.
+	// TODO: if the redirect points at another proxyable resource besides the origin, rewrite that too.
+	fmt.Printf("%s %s %s vs %s %s %s", u.Hostname(), u.Port(), u.Scheme, p.backendURL.Hostname(), p.backendURL.Port(), p.backendURL.Scheme)
+	if u.Hostname() == p.backendURL.Hostname() && u.Port() == p.backendURL.Port() && u.Scheme == p.backendURL.Scheme {
+		n, err := url.Parse(fmt.Sprintf("%s://%s/%s", req.URL.Scheme, req.URL.Host, u.RequestURI()))
+		if err != nil {
+			return nil, fmt.Errorf("Error parsing generated URL for redirect: %v", err)
+		}
+		fmt.Printf("Location matched - patching redirect to %s\n", n.String())
+		return n, nil
+	}
+	fmt.Printf("Location didn't match, not rewriting redirect\n")
+	return nil, nil
 }
 
 func main() {
+	args.HTTPSPort = 8443
+	args.DNSPort = 5335
 	arg.MustParse(&args)
 	args.CertName = "*." + args.ProxyDomain
 	args.Zone = args.ProxyDomain + "."
@@ -59,13 +250,20 @@ func main() {
 			panic(err)
 		}
 	}
+	x509cert, err := x509.ParseCertificate(tlscert.Certificate[0])
+	if err != nil {
+		panic("error parsing cert")
+	}
+	remaining := time.Until(x509cert.NotAfter)
+	fmt.Printf("%d days remaining before certificate expiration\n", int(remaining.Hours())/24)
 	// TODO: eventually changing certs on the fly will require using a tls.Listener
 	cfg := &tls.Config{Certificates: []tls.Certificate{*tlscert}}
 	srv := &http.Server{
-		Addr:         ":8443",
+		Addr:         fmt.Sprintf(":%d", args.HTTPSPort),
 		TLSConfig:    cfg,
 		ReadTimeout:  time.Minute,
 		WriteTimeout: time.Minute,
+		Handler:      newProxy(),
 	}
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
@@ -135,10 +333,9 @@ func runDNS(ctx context.Context) {
 
 	// start server
 	// can redirect with something like
-	// iptables -t nat -A PREROUTING -p udp  --dport 53 -j REDIRECT --to-ports 5353
-	port := 5353
-	server := &dns.Server{Addr: ":" + strconv.Itoa(port), Net: "udp"}
-	log.Printf("Starting at %d\n", port)
+	// iptables -t nat -A PREROUTING -p udp  --dport 53 -j REDIRECT --to-ports 5335
+	server := &dns.Server{Addr: fmt.Sprintf(":%d", args.DNSPort), Net: "udp"}
+	log.Printf("Starting at %d\n", args.DNSPort)
 	err := server.ListenAndServe()
 	if err != nil {
 		log.Fatalf("Failed to start server: %s\n ", err.Error())
