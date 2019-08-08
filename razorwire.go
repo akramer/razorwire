@@ -43,7 +43,7 @@ var args struct {
 	Password    string   `arg:"required"`
 	CertName    string   `arg:"-"`
 	Zone        string   `arg:"-"`
-	ProxyName   []string `help:"hosts to proxy, 'name,http://somehost/', multiple are allowed"`
+	Proxy       []string `arg:"separate" help:"hosts to proxy, 'name,http://somehost/', multiple are allowed"`
 }
 
 type proxy struct {
@@ -64,7 +64,7 @@ func newProxy() proxy {
 	p := proxy{}
 	p.backendURLMap = make(map[string]*url.URL)
 	p.clientMap = make(map[string]*http.Client)
-	for _, n := range args.ProxyName {
+	for _, n := range args.Proxy {
 		vals := strings.Split(n, ",")
 		if len(vals) != 2 {
 			panic(fmt.Sprintf("Error with --proxyname arg: %s", n))
@@ -93,12 +93,14 @@ func (p proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := strings.Split(r.Host, ".")
-	u, ok := p.backendURLMap[s[0]]
-	var err error
 	cl, ok := p.clientMap[s[0]]
 	if !ok {
+		fmt.Printf("Creating new http.Client for %s\n", s[0])
 		cl = newClient()
+		p.clientMap[s[0]] = cl
 	}
+	u, ok := p.backendURLMap[s[0]]
+	var err error
 	if !ok {
 		if sm := proxyRegexp.FindStringSubmatch(s[0]); sm != nil {
 			var ur string
@@ -148,19 +150,11 @@ func (p *proxyRequest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Adding header %s: %v\n", k, v)
 		header[k] = v
 	}
-	fmt.Printf("Done adding headers\n")
-	// TODO: figure this out
-	// do I want rawpath or path?
-	fmt.Printf("backendurl: %v", p.backendURL)
-	weirdurl := fmt.Sprintf("%s://%s%s", p.backendURL.Scheme, p.backendURL.Host, r.RequestURI)
-	fmt.Printf("Parsing url %s\n", weirdurl)
-	u, err := url.Parse(weirdurl)
-	fmt.Printf("post-parse\n")
+	u, err := url.Parse(fmt.Sprintf("%s://%s%s", p.backendURL.Scheme, p.backendURL.Host, r.RequestURI))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	fmt.Printf("up to the middle of HTTP proxying\n")
 	req := http.Request{
 		URL:           u,
 		Method:        r.Method,
@@ -186,7 +180,7 @@ func (p *proxyRequest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for k, v := range resp.Header {
-		if k == "Connection" {
+		if k == "Connection" || k == "X-Forwarded-Proto" || k == "Strict-Transport-Security" {
 			continue
 		}
 		if redirectURL != nil {
@@ -198,6 +192,8 @@ func (p *proxyRequest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, vs)
 		}
 		w.Header().Add("Strict-Transport-Security", "max-age=31536000;")
+		w.Header().Add("X-Forwarded-Proto", "https")
+		w.Header().Add("X-Forwarded-For", r.RemoteAddr)
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
