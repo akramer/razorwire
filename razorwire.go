@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"time"
 
+	localdns "github.com/akramer/razorwire/dns"
 	"github.com/akramer/razorwire/proxy"
 	"github.com/alexflint/go-arg"
 	"github.com/jetstack/cert-manager/third_party/crypto/acme"
@@ -45,6 +46,7 @@ var args struct {
 }
 
 func main() {
+	localdns.LookupServer()
 	args.HTTPSPort = 8443
 	args.DNSPort = 5335
 	arg.MustParse(&args)
