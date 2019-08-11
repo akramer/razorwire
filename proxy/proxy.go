@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/akramer/razorwire/auth"
 )
 
 // Proxy represents a reverse proxy that handles several configured backends.
@@ -21,6 +23,7 @@ var proxyRegexp = regexp.MustCompile("^(http|https|nohttps)-([0-9]+)-([0-9]+)-([
 
 // newProxy initializes a new proxy based on commandline arguments
 func New(args []string, username, password string) *Proxy {
+	auth.Initialize()
 	p := Proxy{
 		username: username,
 		password: password,
@@ -86,6 +89,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := strings.Split(r.Host, ".")
+	if s[0] == "auth" {
+		auth.Mux.ServeHTTP(w, r)
+		return
+	}
 	var err error
 	validate := true
 	u, ok := p.backendURLMap[s[0]]

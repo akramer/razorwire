@@ -46,7 +46,7 @@ var args struct {
 }
 
 func main() {
-	localdns.LookupServer()
+	localdns.LookupMyAddress()
 	args.HTTPSPort = 8443
 	args.DNSPort = 5335
 	arg.MustParse(&args)

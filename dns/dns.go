@@ -9,7 +9,11 @@ import (
 	"github.com/miekg/dns"
 )
 
-func LookupServer() {
+// TODO: update DNS using https://support.google.com/domains/answer/6147083?hl=en
+
+// LookupMyAddress returns the ipv4 and ipv6 addresses of this host.
+// Value will be an empty string if a particular IP version fails.
+func LookupMyAddress() (string, string) {
 	r := net.Resolver{}
 	var ipv4, ipv6 []string
 	for _, a := range []string{"ns1.google.com", "ns2.google.com", "ns3.google.com", "ns4.google.com"} {
@@ -19,11 +23,11 @@ func LookupServer() {
 		}
 		for _, addr := range addrs {
 			if strings.IndexByte(addr, '.') != -1 {
-				fmt.Printf("Found ipv4 address %s\n", addr)
+				fmt.Printf("Found ipv4 address %s for %s\n", addr, a)
 				ipv4 = append(ipv4, addr)
 			}
 			if strings.IndexByte(addr, ':') != -1 {
-				fmt.Printf("Found ipv6 address %s\n", addr)
+				fmt.Printf("Found ipv6 address %s for %s\n", addr, a)
 				ipv6 = append(ipv6, addr)
 			}
 		}
@@ -47,6 +51,7 @@ func LookupServer() {
 		}
 	}
 	fmt.Printf("My ipv4 address is %s, ipv6 address is %s\n", myipv4, myipv6)
+	return myipv4, myipv6
 }
 
 func myAddressVia(addr string) (string, error) {
