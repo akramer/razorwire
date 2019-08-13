@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/akramer/razorwire/auth"
 	localdns "github.com/akramer/razorwire/dns"
 	"github.com/akramer/razorwire/proxy"
 	"github.com/alexflint/go-arg"
@@ -32,7 +33,7 @@ const (
 )
 
 var args struct {
-	Email       string   `arg:"required" help:"e-mail to register with LetsEncrypt"`
+	Email       string   `arg:"required" help:"e-mail to register with LetsEncrypt and PUBLICLY DISPLAY on the oauth privacy policy"`
 	ProxyDomain string   `arg:"required" help:"domain pointed at this server"`
 	Hostname    string   `arg:"required" help:"hostname pointed at this server"`
 	IP          string   `arg:"required" help:"IP address of this proxy"`
@@ -50,9 +51,10 @@ func main() {
 	args.HTTPSPort = 8443
 	args.DNSPort = 5335
 	arg.MustParse(&args)
+	auth.Email = args.Email
+	auth.ProxyDomain = args.ProxyDomain
 	args.CertName = "*." + args.ProxyDomain
 	args.Zone = args.ProxyDomain + "."
-	fmt.Println("Hello world")
 	cache := autocert.DirCache(".")
 	ctx := context.Background()
 	client, err := makeClient(ctx, cache)

@@ -77,6 +77,11 @@ func newReverseProxy(backend *url.URL, validateCert bool) *httputil.ReverseProxy
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s := strings.Split(r.Host, ".")
+	if s[0] == "auth" {
+		auth.Mux.ServeHTTP(w, r)
+		return
+	}
 	user, password, ok := r.BasicAuth()
 	if !ok {
 		w.Header().Add("WWW-Authenticate", "Basic realm=\"authenticate\"")
@@ -86,11 +91,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if user != p.username || password != p.password {
 		w.Header().Add("WWW-Authenticate", "Basic realm=\"authenticate\"")
 		http.Error(w, "error in basic auth", 401)
-		return
-	}
-	s := strings.Split(r.Host, ".")
-	if s[0] == "auth" {
-		auth.Mux.ServeHTTP(w, r)
 		return
 	}
 	var err error
